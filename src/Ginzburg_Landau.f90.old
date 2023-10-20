@@ -1,0 +1,781 @@
+module Ginzburg_Landau
+  use LightKrylov
+  use params, only : parameters
+  use stdlib_io_npy, only : save_npy
+  implicit none
+  private
+
+  public :: matrix_extraction
+
+  ! --> Definition of the vector type.
+  type, extends(abstract_vector), public :: vector
+     real(kind=wp) :: state(1:1000, 2)
+   contains
+     private
+     procedure, pass(self), public :: zero
+     procedure, pass(self), public :: dot
+     procedure, pass(self), public :: scal
+     procedure, pass(self), public :: axpby
+  end type vector
+
+  ! --> Definition of the Jacobian matrix.
+  type, extends(abstract_linop), public :: jacobian
+     type(parameters) :: p
+   contains
+     private
+     procedure, pass(self), public :: matvec  => jac_vec
+     procedure, pass(self), public :: rmatvec => vec_jac
+  end type jacobian
+
+  ! --> Definition of the Exponential Propagator.
+  type, extends(abstract_linop), public :: exponential_propagator
+     type(parameters) :: p
+   contains
+     private
+     procedure, pass(self), public :: matvec  => direct_solver
+     procedure, pass(self), public :: rmatvec => adjoint_solver
+  end type exponential_propagator
+
+  ! --> Definition of the I - exponential_propagator.
+  type, extends(abstract_linop) :: steady_state_operator
+     type(parameters) :: p
+   contains
+     private
+     procedure, pass(self), public :: matvec  => steady_state_matvec
+     procedure, pass(self), public :: rmatvec => steady_state_rmatvec
+  end type steady_state_operator
+
+  ! --> Definition of the resolvent operator.
+  type, extends(abstract_linop), public :: resolvent
+     type(parameters) :: p
+   contains
+     private
+     procedure, pass(self), public :: matvec  => resolvent_matvec
+     procedure, pass(self), public :: rmatvec => resolvent_rmatvec
+  end type resolvent
+
+  type, extends(abstract_linop), public :: resolvent_spd
+     type(parameters) :: p
+   contains
+     private
+     procedure, pass(self), public :: matvec  => resolvent_matvec_spd
+     procedure, pass(self), public :: rmatvec => resolvent_matvec_spd
+  end type resolvent_spd
+
+contains
+
+  !--------------------------------------------------
+  !-----                                        -----
+  !-----     DEFINITION OF THE TIME-STEPPER     -----
+  !-----                                        -----
+  !--------------------------------------------------
+
+  subroutine matrix_extraction(p)
+    !> Parameter container.
+    type(parameters) :: p
+    !> Jacobian operator.
+    class(jacobian), allocatable :: Jac
+    type(vector), allocatable :: x, y
+    !> Dynamics matrix.
+    complex(kind=wp) :: A(p%nx, p%nx)
+    !> Identity matrix.
+    complex(kind=wp) :: Id(p%nx, p%nx)
+    !> Miscellaneous.
+    integer :: i, j, k
+
+    Jac = jacobian() ; x = vector(Id(:, 1:2)) ; y = vector(Id(:, 1:2))
+    Jac%p = p
+
+    ! --> Identity matrix.
+    do i = 1, p%nx
+       Id(i, i) = (1.0_wp, 0.0_wp)
+    enddo
+
+    ! --> Matrix extraction.
+    do i = 1, p%nx
+       call x%zero() ; call y%zero()
+       x%state(:, 1) = Id(:, i)
+       call Jac%matvec(x, y)
+       A(:, i) = y%state(:, 1) * (1.0_wp, 0.0_wp) + y%state(:, 2) * (0.0_wp, 1.0_wp)
+       ! call rhs(A(:, i), Id(:, i), p)
+    enddo
+
+    call save_npy("Dynamics_matrix.npy", A)
+
+    return
+  end subroutine matrix_extraction
+
+  subroutine rhs(du, u, p)
+    !> Time-derivative of the state vector.
+    complex(kind=wp), intent(out)   :: du(:)
+    !> State vector of the system.
+    complex(kind=wp), intent(in)    :: u(:)
+    !> Simulation parameters.
+    type(parameters), intent(in)    :: p
+
+    !> Miscellaneous.
+    integer :: i, j, k
+
+    ! --> Initialize time-derivative.
+    du = (0.0_wp, 0.0_wp)
+
+    ! --> Left most boundary point.
+    du(1) = -p%nu * u(2) / (2.0_wp * p%dx)
+    du(1) = du(1) + p%gamma*(u(2) - 2.0_wp*u(1)) / p%dx**2
+    du(1) = du(1) + p%mu(1) * u(1)
+
+    ! --> Interior nodes.
+    do i = 2, p%nx-1
+       ! --> Convective term.
+       du(i) = -p%nu * (u(i+1) - u(i-1)) / (2.0_wp * p%dx)
+       ! --> Diffusion.
+       du(i) = du(i) + p%gamma * (u(i+1) - 2.0_wp*u(i) + u(i-1)) / p%dx**2
+       ! --> Driving term.
+       du(i) = du(i) + p%mu(i) * u(i)
+    enddo
+
+    ! --> Right most boundary point.
+    du(p%nx) = p%nu * u(p%nx-1) / (2.0_wp * p%dx)
+    du(p%nx) = du(p%nx) + p%gamma * (-2.0_wp * u(p%nx) - u(p%nx-1)) / p%dx**2
+    du(p%nx) = du(p%nx) + p%mu(p%nx) * u(p%nx)
+
+    return
+  end subroutine rhs
+
+  subroutine forcing(du, f, t, p)
+    !> Time-derivative of the state vector.
+    complex(kind=wp), intent(inout) :: du(:)
+    !> State vector of the forcing term.
+    complex(kind=wp), intent(in)    :: f(:)
+    !> Current simulation time.
+    real(kind=wp), intent(in)       :: t
+    !> Simulation parameters.
+    type(parameters), intent(in)    :: p
+    !> Miscellaneous.
+    integer :: i, j, k
+
+    do i = 1, p%nx-1
+       du(i) = du(i) + f(i) * cmplx(cos(p%omega*t), sin(p%omega*t))
+    enddo
+
+    return
+  end subroutine forcing
+
+  subroutine adjoint_forcing(du, f, t, p)
+    !> Time-derivative of the state vector.
+    complex(kind=wp), intent(inout) :: du(:)
+    !> State vector of the forcing term.
+    complex(kind=wp), intent(in)    :: f(:)
+    !> Current simulation time.
+    real(kind=wp), intent(in)       :: t
+    !> Simulation parameters.
+    type(parameters), intent(in)    :: p
+    !> Miscellaneous.
+    integer :: i, j, k
+
+    do i = 1, p%nx-1
+       du(i) = du(i) + f(i) * cmplx(cos(p%omega*t), -sin(p%omega*t))
+    enddo
+
+    return
+  end subroutine adjoint_forcing
+
+
+  subroutine step(u, p)
+    !> State vector of the system.
+    complex(kind=wp), intent(inout) :: u(:)
+    !> Simulation parameters.
+    type(parameters), intent(in)    :: p
+
+    !> RK substeps.
+    complex(kind=wp) :: k(size(u), 4)
+    real(kind=wp)    :: coefs(4) = [1.0_wp, 2.0_wp, 2.0_wp, 1.0_wp] / 6.0_wp
+
+    !> Runge-Kutta integration.
+    call rhs(k(:, 1), u, p)
+    call rhs(k(:, 2), u + p%dt/2.0_wp * k(:, 1), p)
+    call rhs(k(:, 3), u + p%dt/2.0_wp * k(:, 2), p)
+    call rhs(k(:, 4), u + p%dt * k(:, 3), p)
+
+    !> New state.
+    u(:) = u(:) + p%dt * matmul(k, coefs)
+
+    return
+  end subroutine step
+
+  subroutine forced_step(u, f, t, p)
+    !> State vector of the system.
+    complex(kind=wp), intent(inout) :: u(:)
+    !> Forcing term.
+    complex(kind=wp), intent(in)    :: f(:)
+    !> Current simulation time.
+    real(kind=wp)   , intent(in)    :: t
+    !> Simulation parameters.
+    type(parameters), intent(in)    :: p
+
+    !> RK substeps.
+    complex(kind=wp) :: k(size(u), 4)
+    real(kind=wp)    :: coefs(4) = [1.0_wp, 2.0_wp, 2.0_wp, 1.0_wp] / 6.0_wp
+
+    !> Runge-Kutta integration.
+    call rhs(k(:, 1), u, p) ; call forcing(k(:, 1), f, t, p)
+    call rhs(k(:, 2), u + p%dt/2.0_wp * k(:, 1), p) ; call forcing(k(:, 2), f, t+p%dt/2.0_wp, p)
+    call rhs(k(:, 3), u + p%dt/2.0_wp * k(:, 2), p) ; call forcing(k(:, 3), f, t+p%dt/2.0_wp, p)
+    call rhs(k(:, 4), u + p%dt * k(:, 3), p) ; call forcing(k(:, 4), f, t+p%dt, p)
+
+    !> New state.
+    u(:) = u(:) + p%dt * matmul(k, coefs)
+
+    return
+  end subroutine forced_step
+
+  !----------------------------------------------------------
+  !-----                                                -----
+  !-----     DEFINITION OF THE ADJOINT TIME-STEPPER     -----
+  !-----                                                -----
+  !----------------------------------------------------------
+
+  subroutine adjoint_rhs(du, u, p)
+    !> Time-derivative of the state vector.
+    complex(kind=wp), intent(out) :: du(:)
+    !> State vector of the system.
+    complex(kind=wp), intent(in)  :: u(:)
+    !> Simulation parameters.
+    type(parameters), intent(in)  :: p
+
+    !> Miscellaneous.
+    integer :: i, j, k
+
+    ! --> Initialize time-derivative.
+    du = (0.0_wp, 0.0_wp)
+
+    ! --> Left-most boundary point.
+    du(1) = conjg(p%nu) * u(2) / (2.0_wp*p%dx)
+    du(1) = du(1) + conjg(p%gamma) * (u(2) - 2.0_wp *u(1)) / p%dx**2
+    du(1) = du(1) + p%mu(1) * u(1)
+
+    ! --> Inner points.
+    do i = 2, p%nx-1
+       ! --> Convective term.
+       du(i) = conjg(p%nu) * (u(i+1) - u(i-1)) / (2.0_wp * p%dx)
+       ! --> Diffusion.
+       du(i) = du(i) + conjg(p%gamma) * (u(i+1) - 2.0_wp * u(i) + u(i-1)) / p%dx**2
+       ! --> Driving term.
+       du(i) = du(i) + p%mu(i) * u(i)
+    enddo
+
+    ! --> Right-most boundary point.
+    du(p%nx) = conjg(p%nu) * (-u(p%nx-1)) / (2.0_wp * p%dx)
+    du(p%nx) = du(p%nx) + conjg(p%gamma) * (-2.0_wp * u(p%nx) + u(p%nx-1)) / p%dx**2
+    du(p%nx) = du(p%nx) + p%mu(p%nx) * u(p%nx)
+
+    return
+  end subroutine adjoint_rhs
+
+  subroutine adjoint_step(u, p)
+    !> State vector of the system.
+    complex(kind=wp), intent(inout) :: u(:)
+    !> Simulation parameters.
+    type(parameters), intent(in)    :: p
+
+    !> RK substeps.
+    complex(kind=wp) :: k(size(u), 4)
+    real(kind=wp)    :: coefs(4) = [1.0_wp, 2.0_wp, 2.0_wp, 1.0_wp] / 6.0_wp
+
+    !> Runge-Kutta integration.
+    call adjoint_rhs(k(:, 1), u, p)
+    call adjoint_rhs(k(:, 2), u + p%dt/2.0_wp * k(:, 1), p)
+    call adjoint_rhs(k(:, 3), u + p%dt/2.0_wp * k(:, 2), p)
+    call adjoint_rhs(k(:, 4), u + p%dt * k(:, 3), p)
+
+    !> New state.
+    u(:) = u(:) + p%dt * matmul(k, coefs)
+
+    return
+  end subroutine adjoint_step
+
+  subroutine adjoint_forced_step(u, f, t, p)
+    !> State vector of the system.
+    complex(kind=wp), intent(inout) :: u(:)
+    !> Forcing term.
+    complex(kind=wp), intent(in)    :: f(:)
+    !> Current simulation time.
+    real(kind=wp)   , intent(in)    :: t
+    !> Simulation parameters.
+    type(parameters), intent(in)    :: p
+
+    !> RK substeps.
+    complex(kind=wp) :: k(size(u), 4)
+    real(kind=wp)    :: coefs(4) = [1.0_wp, 2.0_wp, 2.0_wp, 1.0_wp] / 6.0_wp
+
+    !> Runge-Kutta integration.
+    call adjoint_rhs(k(:, 1), u, p) ; call adjoint_forcing(k(:, 1), f, t, p)
+    call adjoint_rhs(k(:, 2), u + p%dt/2.0_wp * k(:, 1), p) ; call adjoint_forcing(k(:, 2), f, t+p%dt/2.0_wp, p)
+    call adjoint_rhs(k(:, 3), u + p%dt/2.0_wp * k(:, 2), p) ; call adjoint_forcing(k(:, 3), f, t+p%dt/2.0_wp, p)
+    call adjoint_rhs(k(:, 4), u + p%dt * k(:, 3), p) ; call adjoint_forcing(k(:, 4), f, t+p%dt, p)
+
+    !> New state.
+    u(:) = u(:) + p%dt * matmul(k, coefs)
+
+    return
+  end subroutine adjoint_forced_step
+
+
+  !----------------------------------------------------------------------
+  !-----                                                            -----
+  !-----      DEFINITION OF THE TYPE-BOUND PROCEDURE FOR VECTOR     -----
+  !-----                                                            -----
+  !----------------------------------------------------------------------
+
+  ! --> Zero-out a vector.
+  subroutine zero(self)
+    class(vector), intent(inout) :: self
+    self%state = 0.0_wp
+    return
+  end subroutine zero
+
+  ! --> Definition of the dot product.
+  double precision function dot(self, vec) result(alpha)
+    class(vector), intent(in)          :: self
+    class(abstract_vector), intent(in) :: vec
+
+    select type(vec)
+    type is(vector)
+       alpha = dot_product(self%state(:, 1), vec%state(:, 1))
+       alpha = alpha + dot_product(self%state(:, 2), vec%state(:, 2))
+    end select
+
+    return
+  end function dot
+
+  ! --> Definition of the scalar multiplication.
+  subroutine scal(self, alpha)
+    class(vector), intent(inout) :: self
+    real(kind=wp), intent(in) :: alpha
+    self%state = self%state * alpha
+    return
+  end subroutine scal
+
+  subroutine axpby(self, alpha, vec, beta)
+    class(vector), intent(inout) :: self
+    class(abstract_vector), intent(in) :: vec
+    real(kind=wp), intent(in) :: alpha, beta
+    select type(vec)
+    type is(vector)
+       self%state = alpha*self%state + beta*vec%state
+    end select
+    return
+  end subroutine axpby
+
+  !----------------------------------------------------------------------------
+  !-----                                                                  -----
+  !-----     DEFINITION OF THE TYPE-BOUND PROCEDURES FOR THE JACOBIAN     -----
+  !-----                                                                  -----
+  !----------------------------------------------------------------------------
+
+  subroutine jac_vec(self, vec_in, vec_out)
+    !> Jacobian matrix.
+    class(jacobian), intent(in) :: self
+    !> State vector.
+    class(abstract_vector), intent(in) :: vec_in
+    !> Time-derivative.
+    class(abstract_vector), intent(out) :: vec_out
+
+    !> Miscellaneous.
+    complex(kind=wp), allocatable :: u(:), du(:)
+
+    select type(vec_in)
+    type is(vector)
+       select type(vec_out)
+       type is(vector)
+
+          ! --> Allocate state vector.
+          allocate(u(1:self%p%nx))
+          u = vec_in%state(:, 1) * (1.0_wp, 0.0_wp) + vec_in%state(:, 2) * (0.0_wp, 1.0_wp)
+
+          ! --> Allocate time derivative.
+          allocate(du(1:self%p%nx)) ; du = (0.0_wp, 0.0_wp)
+
+          ! --> Matrix-vector product.
+          call rhs(du, u, self%p)
+
+          ! --> Return output vector.
+          vec_out%state(:, 1) = real(du)
+          vec_out%state(:, 2) = aimag(du)
+
+          ! --> Deallocate arrays.
+          deallocate(u, du)
+
+       end select
+    end select
+
+    return
+  end subroutine jac_vec
+
+  subroutine vec_jac(self, vec_in, vec_out)
+    !> Jacobian matrix.
+    class(jacobian), intent(in) :: self
+    !> State vector.
+    class(abstract_vector), intent(in) :: vec_in
+    !> Time-derivative.
+    class(abstract_vector), intent(out) :: vec_out
+
+    !> Miscellaneous.
+    complex(kind=wp), allocatable :: u(:), du(:)
+
+    select type(vec_in)
+    type is(vector)
+       select type(vec_out)
+       type is(vector)
+
+          ! --> Allocate state vector.
+          allocate(u(1:self%p%nx))
+          u = vec_in%state(:, 1) * (1.0_wp, 0.0_wp) + vec_in%state(:, 2) * (0.0_wp, 1.0_wp)
+
+          ! --> Allocate time derivative.
+          allocate(du(1:self%p%nx)) ; du = 0.0_wp
+
+          ! --> Matrix-vector product.
+          call adjoint_rhs(du, u, self%p)
+
+          ! --> Return output vector.
+          vec_out%state(:, 1) = real(du)
+          vec_out%state(:, 2) = aimag(du)
+
+          ! --> Deallocate arrays.
+          deallocate(u, du)
+
+       end select
+    end select
+
+    return
+  end subroutine vec_jac
+
+  !-----------------------------------------------------------------------------------
+  !-----                                                                         -----
+  !-----     DEFINITION OF THE TYPE-BOUND PROCEDURES FOR THE EXP. PROPAGATOR     -----
+  !-----                                                                         -----
+  !-----------------------------------------------------------------------------------
+
+  subroutine direct_solver(self, vec_in, vec_out)
+    !> Exponential Propagator.
+    class(exponential_propagator), intent(in)  :: self
+    !> State vector at time 0.
+    class(abstract_vector)       , intent(in)  :: vec_in
+    !> State vector at time T.
+    class(abstract_vector)       , intent(out) :: vec_out
+
+    !> Miscellaneous.
+    integer                       :: istep
+    complex(kind=wp), allocatable :: u(:)
+    class(jacobian), allocatable :: J
+    class(abstract_vector), allocatable :: wrk
+
+    ! J = jacobian() ; J%p = self%p
+    ! wrk = vec_in
+    ! call expv(J%p%t, J, wrk, kmax=24)
+    ! call vec_out%zero() ; call vec_out%add(wrk)
+
+    select type(vec_in)
+    type is(vector)
+       select type(vec_out)
+       type is(vector)
+          ! --> Allocate state vector.
+          allocate(u(1:self%p%nx))
+          u = vec_in%state(:, 1)*(1.0_wp, 0.0_wp) + vec_in%state(:, 2)*(0.0_wp, 1.0_wp)
+          ! --> Integrate the equations.
+          do istep = 1, self%p%nsteps
+             call step(u, self%p)
+          enddo
+          ! --> Return output vector.
+          vec_out%state(:, 1) = real(u)
+          vec_out%state(:, 2) = aimag(u)
+          ! --> Deallocate arrays.
+          deallocate(u)
+       end select
+    end select
+
+    return
+  end subroutine direct_solver
+
+  subroutine adjoint_solver(self, vec_in, vec_out)
+    !> Exponential Propagator.
+    class(exponential_propagator), intent(in)  :: self
+    !> State vector at time 0.
+    class(abstract_vector)       , intent(in)  :: vec_in
+    !> State vector at time T.
+    class(abstract_vector)       , intent(out) :: vec_out
+
+    !> Miscellaneous.
+    integer                       :: istep
+    complex(kind=wp), allocatable :: u(:)
+
+    select type(vec_in)
+    type is(vector)
+       select type (vec_out)
+          type is(vector)
+             ! --> Allocate adjoint state vector.
+             allocate(u(1:self%p%nx))
+             u = vec_in%state(:, 1)*(1.0_wp, 0.0_wp) + vec_in%state(:, 2)*(0.0_wp, 1.0_wp)
+             ! --> Integrate the equations.
+             do istep = 1, self%p%nsteps
+                call adjoint_step(u, self%p)
+             enddo
+             ! --> Return output vector.
+             vec_out%state(:, 1) = real(u)
+             vec_out%state(:, 2) = aimag(u)
+             ! --> Deallocate arrays.
+             deallocate(u)
+          end select
+    end select
+
+    return
+  end subroutine adjoint_solver
+
+  !-----------------------------------------------------------------------------------------
+  !-----                                                                               -----
+  !-----     DEFINITION OF THE TYPE-BOUND PROCEDURES FOR THE STEADY-STATE OPERATOR     -----
+  !-----                                                                               -----
+  !-----------------------------------------------------------------------------------------
+
+  subroutine steady_state_matvec(self, vec_in, vec_out)
+    !> Steady-state operator.
+    class(steady_state_operator), intent(in)  :: self
+    !> Input vector.
+    class(abstract_vector)      , intent(in)  :: vec_in
+    !> Output vector.
+    class(abstract_vector)      , intent(out) :: vec_out
+
+    !> Exponential propagator.
+    class(exponential_propagator), allocatable :: A
+
+    ! --> Initialize.
+    A = exponential_propagator() ; A%p = self%p
+
+    ! --> Apply the exponential propagator.
+    call A%matvec(vec_in, vec_out)
+
+    ! --> Compute x - exp(At)*x
+    call vec_out%axpby(-1.0_wp, vec_in, 1.0_wp)
+
+    return
+  end subroutine steady_state_matvec
+
+  subroutine steady_state_rmatvec(self, vec_in, vec_out)
+    !> Steady-state operator.
+    class(steady_state_operator), intent(in)  :: self
+    !> Input vector.
+    class(abstract_vector)      , intent(in)  :: vec_in
+    !> Output vector.
+    class(abstract_vector)      , intent(out) :: vec_out
+
+    !> Exponential propagator.
+    class(exponential_propagator), allocatable :: A
+
+    ! --> Initialize.
+    A = exponential_propagator() ; A%p = self%p
+
+    ! --> Apply the adjoint exponential propagator.
+    call A%rmatvec(vec_in, vec_out)
+
+    ! --> Compute x - exp(A.T t)*x
+    call vec_out%axpby(-1.0_wp, vec_in, 1.0_wp)
+
+    return
+  end subroutine steady_state_rmatvec
+
+  !--------------------------------------------------------------------------------------
+  !-----                                                                            -----
+  !-----     DEFINITION OF THE TYPE-BOUND PROCEDURES FOR THE RESOLVENT OPERATOR     -----
+  !-----                                                                            -----
+  !--------------------------------------------------------------------------------------
+
+  subroutine resolvent_matvec(self, vec_in, vec_out)
+    !> Resolvent operator.
+    class(resolvent), intent(in)  :: self
+    !> Input vector.
+    class(abstract_vector)   , intent(in)  :: vec_in
+    !> Output vector.
+    class(abstract_vector)   , intent(out) :: vec_out
+    !> Miscellaneous.
+    class(abstract_vector), allocatable :: b, wrk1, wrk2
+    integer                             :: istep, info
+    complex(kind=wp), allocatable       :: u(:), f(:)
+    real(kind=wp)                       :: t
+    type(gmres_opts)                    :: opts
+
+    !> Steady-state operator.
+    class(steady_state_operator), allocatable :: A
+
+    ! --> Compute the right-hand-side vector.
+    select type(vec_in)
+    type is(vector)
+       select type(vec_out)
+       type is(vector)
+
+          ! --> Allocate state-vector and forcing.
+          allocate(u(1:self%p%nx), f(1:self%p%nx))
+          u = (0.0_wp, 0.0_wp)
+          f = vec_in%state(:, 1)*(1.0_wp, 0.0_wp) + vec_in%state(:, 2)*(0.0_wp, 1.0_wp)
+
+          ! --> Integrate the forced equations.
+          do istep = 1, self%p%nsteps
+             t = istep * self%p%dt
+             call forced_step(u, f, t, self%p)
+          enddo
+
+          ! --> Right-hand side vector for the GMRES.
+          b = vec_in ; call b%zero()
+          select type(b)
+          type is(vector)
+             b%state(:, 1) = real(u) ; b%state(:, 2) = aimag(u)
+          end select
+
+       end select
+    end select
+
+    ! --> Solve for the particular solution.
+    call vec_out%zero() ; A = steady_state_operator() ; A%p = self%p
+    opts = gmres_opts(atol=atol, rtol=0.0_wp, verbose=.false., kdim=128)
+    call gmres(A, b, vec_out, info, options=opts)
+
+    return
+  end subroutine resolvent_matvec
+
+  subroutine resolvent_rmatvec(self, vec_in, vec_out)
+    !> Resolvent operator.
+    class(resolvent), intent(in)  :: self
+    !> Input vector.
+    class(abstract_vector)   , intent(in)  :: vec_in
+    !> Output vector.
+    class(abstract_vector)   , intent(out) :: vec_out
+    !> Miscellaneous.
+    class(abstract_vector), allocatable :: b, wrk1, wrk2
+    integer                             :: istep, info
+    complex(kind=wp), allocatable       :: u(:), f(:)
+    real(kind=wp)                       :: t
+    type(gmres_opts)                    :: opts
+
+    !> Adjoint exponential propagator.
+    class(steady_state_operator), allocatable :: A
+
+
+    ! --> Compute the right-hand-side vector.
+    select type(vec_in)
+    type is(vector)
+       select type(vec_out)
+       type is(vector)
+
+          ! --> Allocate state-vector and forcing.
+          allocate(u(1:self%p%nx), f(1:self%p%nx))
+          u = (0.0_wp, 0.0_wp)
+          f = vec_in%state(:, 1)*(1.0_wp, 0.0_wp) + vec_in%state(:, 2)*(0.0_wp, 1.0_wp)
+
+          ! --> Integrate the forced equations.
+          do istep = 1, self%p%nsteps
+             t = istep * self%p%dt
+             call adjoint_forced_step(u, f, t, self%p)
+          enddo
+
+          ! --> Right-hand side vector for the GMRES.
+          b = vec_in ; call b%zero()
+          select type(b)
+          type is(vector)
+             b%state(:, 1) = real(u) ; b%state(:, 2) = aimag(u)
+          end select
+
+       end select
+    end select
+
+    ! --> Solve for the particular solution.
+    call vec_out%zero() ; A = steady_state_operator() ; A%p = self%p
+    opts = gmres_opts(atol=atol, rtol=0.0_wp, verbose=.false., kdim=128)
+    call gmres(A, b, vec_out, info, transpose=.true., options=opts)
+
+    return
+  end subroutine resolvent_rmatvec
+
+  subroutine resolvent_matvec_spd(self, vec_in, vec_out)
+    !> Resolvent operator.
+    class(resolvent_spd), intent(in)  :: self
+    !> Input vector.
+    class(abstract_vector)   , intent(in)  :: vec_in
+    !> Output vector.
+    class(abstract_vector)   , intent(out) :: vec_out
+    !> Miscellaneous.
+    class(abstract_vector), allocatable :: b, wrk1, wrk2
+    integer                             :: istep, info
+    complex(kind=wp), allocatable       :: u(:), f(:)
+    real(kind=wp)                       :: t
+    
+    !> Steady-state operator.
+    class(steady_state_operator), allocatable :: A
+    
+    ! --> Compute the right-hand-side vector.
+    select type(vec_in)
+    type is(vector)
+       select type(vec_out)
+       type is(vector)
+
+          ! --> Allocate state-vector and forcing.
+          allocate(u(1:self%p%nx), f(1:self%p%nx))
+          u = (0.0_wp, 0.0_wp)
+          f = vec_in%state(:, 1)*(1.0_wp, 0.0_wp) + vec_in%state(:, 2)*(0.0_wp, 1.0_wp)
+
+          ! --> Integrate the forced equations.
+          do istep = 1, self%p%nsteps
+             t = istep * self%p%dt
+             call forced_step(u, f, t, self%p)
+          enddo
+
+          ! --> Right-hand side vector for the GMRES.
+          b = vec_in ; call b%zero()
+          select type(b)
+          type is(vector)
+             b%state(:, 1) = real(u) ; b%state(:, 2) = aimag(u)
+          end select
+
+          write(*, *) "Norm b direct : ", b%norm()
+
+       end select
+    end select
+
+    ! --> Solve for the particular solution.
+    call vec_out%zero() ; A = steady_state_operator() ; A%p = self%p
+    call gmres(A, b, vec_out, info)
+
+    select type(vec_in)
+    type is(vector)
+       select type(vec_out)
+       type is(vector)
+
+          ! --> Allocate state-vector and forcing.
+          u = (0.0_wp, 0.0_wp)
+          f = vec_out%state(:, 1)*(1.0_wp, 0.0_wp) + vec_out%state(:, 2)*(0.0_wp, 1.0_wp)
+
+          ! --> Integrate the forced equations.
+          do istep = 1, self%p%nsteps
+             t = istep * self%p%dt
+             call adjoint_forced_step(u, f, t, self%p)
+          enddo
+
+          ! --> Right-hand side vector for the GMRES.
+          b = vec_in ; call b%zero()
+          select type(b)
+          type is(vector)
+             b%state(:, 1) = real(u) ; b%state(:, 2) = aimag(u)
+          end select
+
+          write(*, *) "Norm b adjoint :", b%norm()
+
+       end select
+    end select
+
+    ! --> Solve for the particular solution.
+    call vec_out%zero()
+    call gmres(A, b, vec_out, info, transpose=.true.)
+
+    return
+  end subroutine resolvent_matvec_spd
+
+end module Ginzburg_Landau

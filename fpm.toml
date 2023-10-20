@@ -1,0 +1,22 @@
+name = "Ginzburg_Landau"
+version = "0.1.0"
+license = "license"
+author = "Jean-Christophe"
+maintainer = "loiseau.jc@gmail.com"
+copyright = "Copyright 2023, Jean-Christophe"
+[build]
+auto-executables = true
+auto-tests = true
+auto-examples = true
+module-naming = false
+[install]
+library = false
+[fortran]
+implicit-typing = false
+implicit-external = false
+source-form = "free"
+
+[dependencies]
+stdlib = "*"
+LightKrylov.git = "https://github.com/nekStab/LightKrylov"
+rklib = { git="https://github.com/jacobwilliams/rklib.git" }
