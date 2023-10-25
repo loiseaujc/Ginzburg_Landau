@@ -15,38 +15,19 @@ program main
   use stdlib_io_npy, only : save_npy
   implicit none
 
-  !> Range of frequencies investigated.
-  real(kind=wp), allocatable :: omega(:)
-  !> Elapsed time.
-  real(kind=wp), allocatable :: elapsed_time(:)
-  integer      , allocatable :: func_evals(:)
-  !> Miscellaneous.
-  integer :: i, j, k
+  ! !> Initialize physical parameters.
+  ! call initialize_parameters() ; call extract_matrix()
 
-  !> Initialize physical parameters.
-  call initialize_parameters()
-
-  !>
+  ! !> Eigenspectrum of the direct and adjoint operator + leading eigenvectors.
   ! call linear_stability_analysis()
-  ! call transient_growth(linspace(1.0_wp, 60.0_wp, 60))
-  ! call resolvent_analysis(linspace(-5.0_wp, 5.0_wp, 101))
 
-  !> Performance timings.
-  omega = linspace(-5.0_wp, 5.0_wp, 101)
-  allocate(elapsed_time(1:size(omega))) ; elapsed_time = 0.0_wp
-  allocate(func_evals(1:size(omega)))   ; func_evals   = 0
+  ! !> Optimal perturbation analysis.
+  ! call transient_growth(linspace(0.5_wp, 50.0_wp, 100))
 
-  do i = 1, size(omega)
-     write(output_unit, *) "--: Circular frequency             :", omega(i)
-     call resolvent_single_freq(omega(i), elapsed_time(i))
-     func_evals(i) = fevals ; fevals = 0
-     write(output_unit, *) "    Elapsed time                   :", elapsed_time(i), "seconds."
-     write(output_unit, *) "    Number of function evaluations :", func_evals(i)
-     write(output_unit, *)
-  enddo
+  ! !> Resolvent analysis.
+  ! call resolvent_analysis(linspace(-5.0_wp, 5.0_wp, 201))
 
-  call save_npy("Elapsed_time_nx128_rkt54.npy", elapsed_time)
-  call save_npy("Function_evaluations_nx128_rkt54.npy", func_evals)
+  call resolvent_computational_statistics()
 
 contains
 
@@ -79,23 +60,37 @@ contains
     alpha = X(1)%norm() ; call X(1)%scal(1.0_wp / alpha)
 
     ! --> Eigenvalue analysis.
+    call eigs(A, X, v, lambda, residuals, info, nev=128, transpose=.false.)
+
+    ! --> Transform eigenspectrum.
+    lambda = log(lambda) / A%t
+
+    ! --> Save the eigenspectrum.
+    call save_eigenspectrum(real(lambda), aimag(lambda), residuals, "Direct_Eigenspectrum.npy")
+    ! --> Save leading eigenvector.
+    call get_vec(wrk, X(1:kdim), real(v(:, 1)))
+    select type(wrk)
+    type is(vector)
+       call save_npy("Leading_direct_eigenvector.npy", wrk%x)
+    end select
+
+    ! --> Initialize Krylov subspace.
+    call random_number(X(1)%x)
+    alpha = X(1)%norm() ; call X(1)%scal(1.0_wp / alpha)
+
+    ! --> Eigenvalue analysis.
     call eigs(A, X, v, lambda, residuals, info, nev=128, transpose=.true.)
 
     ! --> Transform eigenspectrum.
     lambda = log(lambda) / A%t
 
     ! --> Save the eigenspectrum.
-    open(unit=1234, file="adjoint_eigenspectrum.dat")
-    do i = 1, size(lambda)
-       write(1234, *) real(lambda(i)), aimag(lambda(i)), residuals(i)
-    enddo
-    close(1234)
-    ! call save_eigenspectrum(real(lambda), aimag(lambda), residuals, "Direct_Eigenspectrum.npy")
+    call save_eigenspectrum(real(lambda), aimag(lambda), residuals, "Adjoint_Eigenspectrum.npy")
     ! --> Save leading eigenvector.
     call get_vec(wrk, X(1:kdim), real(v(:, 1)))
     select type(wrk)
     type is(vector)
-       call save_npy("Leading_eigenvector.npy", wrk%x)
+       call save_npy("Leading_adjoint_eigenvector.npy", wrk%x)
     end select
 
     return
@@ -232,6 +227,9 @@ contains
     R = resolvent_op(omega)
     sigma = 0.0_wp ; uvecs = 0.0_wp ; vvecs = 0.0_wp ; residuals = 0.0_wp
 
+    write(output_unit, *) "--: Circular frequency : ", omega
+
+
     !> Initialize Krylov subspaces.
     do j = 1, size(U)
        call U(j)%zero() ; call V(j)%zero()
@@ -246,7 +244,42 @@ contains
     !> Elapsed time.
     elapsed_time = end_time - start_time
 
+    write(output_unit, *) "Elapsed time :", elapsed_time
+
     return
   end subroutine resolvent_single_freq
+
+  subroutine resolvent_computational_statistics()
+    !> Range of frequencies.
+    real(kind=wp), allocatable :: omegas(:)
+    integer                    :: nfreqs = 51
+    !> Timings.
+    real(kind=wp), allocatable :: timings(:)
+    !> Functions evaluations.
+    integer, allocatable       :: func_evals(:)
+    !> Miscellaneous.
+    integer :: i, j, k
+    character(len=100) :: filename
+
+    !----------------------------------
+    !-----     INITIALIZATION     -----
+    !----------------------------------
+
+    omegas = linspace(-5.0_wp, 5.0_wp, nfreqs)
+    allocate(timings(nfreqs)) ; allocate(func_evals(nfreqs))
+    timings = 0.0_wp ; func_evals = 0
+
+    do i = 1, nfreqs
+       call resolvent_single_freq(omegas(i), timings(i))
+       func_evals(i) = fevals ; fevals = 0
+    enddo
+
+    write(filename, '(a, i0.4, a)') 'Elapsed_time_nx=', nx, '.npy'
+    call save_npy(filename, timings)
+    write(filename, '(a, i0.4, a)') 'Func_evals_nx=', nx, '.npy'
+    call save_npy(filename, func_evals)
+
+    return
+  end subroutine resolvent_computational_statistics
 
 end program main

@@ -9,7 +9,7 @@ module params
 
   ! --> Mesh related parameters.
   real(kind=wp), parameter :: L = 200.0_wp !> Domain length
-  integer      , parameter :: nx = 128    !> Number of grid points (excluding boundaries).
+  integer      , parameter :: nx = 512     !> Number of grid points (excluding boundaries).
   real(kind=wp), parameter :: dx = L / nx  !> Grid size.
 
   ! --> Physical parameters.

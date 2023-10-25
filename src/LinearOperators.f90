@@ -8,9 +8,12 @@ module LinearOperators
   use params
   !> Time integrators.
   use rklib_module
+  !> Fortran stdlib.
+  use stdlib_io_npy, only : save_npy
   implicit none
 
   private
+  public :: extract_matrix
 
   !-------------------------------------------
   !-----     LIGHTKRYLOV VECTOR TYPE     -----
@@ -50,7 +53,54 @@ module LinearOperators
      procedure, pass(self), public :: rmatvec => adjoint_map
   end type resolvent_op
 
+  !-----------------------------------
+  !-----     JACOBIAN MATRIX     -----
+  !-----------------------------------
+
+  type, extends(abstract_linop), public :: jacobian_op
+   contains
+     private
+     procedure, pass(self), public :: matvec  => jac_matvec
+     procedure, pass(self), public :: rmatvec => jac_rmatvec
+  end type jacobian_op
+
+  !--------------------------------------------
+  !-----     ALBERTO'S PRECONDITIONER     -----
+  !--------------------------------------------
+
+  ! type, extends(abstract_preconditioner), public :: alberto_precond
+  !    type(vector), allocatable  :: U(:)
+  !    type(vector), allocatable  :: V(:)
+  !    real(kind=wp), allocatable :: lambda(:, :)
+  !  contains
+  !    private
+  !    procedure, pass(self), public :: apply => apply_precond
+  !    procedure, pass(self), public :: undo  => undo_precond
+  ! end type alberto_precond
+
 contains
+
+  subroutine extract_matrix()
+    !> Dynamics matrix.
+    real(kind=wp) :: A(2*nx, 2*nx)
+    real(kind=wp) :: Id(2*nx, 2*nx)
+    !> Miscellaneous.
+    integer :: i, j, k
+    type(rkt54_class) :: rk
+
+    A = 0.0_wp ; Id = 0.0_wp
+    do i = 1, size(Id, 1)
+       Id(i, i) = 1.0_wp
+    enddo
+
+    do i = 1, size(Id, 1)
+       call rhs(rk, 0.0_wp, Id(:, i), A(:, i))
+    enddo
+
+    call save_npy("Dynamics_matrix.npy", A)
+
+    return
+  end subroutine extract_matrix
 
   !----------------------------------------------------
   !-----     TYPE-BOUND PROCEDURE FOR VECTORS     -----
@@ -102,7 +152,7 @@ contains
     class(abstract_vector) , intent(out) :: vec_out
 
     !> Time-integrator.
-    type(rkt54_class) :: prop
+    type(rks54_class) :: prop
     !> Tentative time-step.
     real(kind=wp)     :: dt = 1.0_wp
 
@@ -127,7 +177,7 @@ contains
     class(abstract_vector) , intent(out) :: vec_out
 
     !> Time-integrator.
-    type(rkt54_class) :: prop
+    type(rks54_class) :: prop
     !> Tentative time-step.
     real(kind=wp)     :: dt = 1.0_wp
 
@@ -162,7 +212,7 @@ contains
     !> Internal variables.
     real(kind=wp)             :: x0(2*nx) = 0.0_wp, xf(2*nx) = 0.0_wp
     real(kind=wp)             :: forcing(2*nx)
-    type(rkt54_class)         :: prop
+    type(rks54_class)         :: prop
     real(kind=wp)             :: dt = 1.0_wp
     character(len=:), allocatable :: message
 
@@ -300,7 +350,7 @@ contains
     !> Internal variables.
     real(kind=wp)             :: x0(2*nx) = 0.0_wp, xf(2*nx) = 0.0_wp
     real(kind=wp)             :: forcing(2*nx)
-    type(rkt54_class)         :: prop
+    type(rks54_class)         :: prop
     real(kind=wp)             :: dt = 1.0_wp
     character(len=:), allocatable :: message
 
@@ -425,5 +475,47 @@ contains
     end subroutine forced_adjoint_rhs
     
   end subroutine adjoint_map
+
+  !------------------------------------------------------------------
+  !-----     TYPE-BOUND PROCEDURE FOR THE JACOBIAN OPERATOR     -----
+  !------------------------------------------------------------------
+
+  subroutine jac_matvec(self, vec_in, vec_out)
+    class(jacobian_op)    , intent(in)  :: self
+    class(abstract_vector), intent(in)  :: vec_in
+    class(abstract_vector), intent(out) :: vec_out
+
+    !> Internal variables.
+    type(rks54_class) :: rk
+
+    select type(vec_in)
+    type is(vector)
+       select type(vec_out)
+       type is(vector)
+          call rhs(rk, 0.0_wp, vec_in%x, vec_out%x)
+       end select
+    end select
+
+    return
+  end subroutine jac_matvec
+
+  subroutine jac_rmatvec(self, vec_in, vec_out)
+    class(jacobian_op)    , intent(in)  :: self
+    class(abstract_vector), intent(in)  :: vec_in
+    class(abstract_vector), intent(out) :: vec_out
+    
+    !> Internal variables.
+    type(rks54_class) :: rk
+
+    select type(vec_in)
+    type is(vector)
+       select type(vec_out)
+       type is(vector)
+          call adjoint_rhs(rk, 0.0_wp, vec_in%x, vec_out%x)
+       end select
+    end select
+
+    return
+ end subroutine jac_rmatvec
 
 end module LinearOperators
